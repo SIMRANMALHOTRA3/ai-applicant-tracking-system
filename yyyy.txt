@@ -1,0 +1,1215 @@
+#include "pcapreader.h"
+#include <QFile>
+#include <QDebug>
+
+// Helper readers (big/little aware where needed)
+static inline quint16 readU16LE(const QByteArray &b, int off) {
+    const unsigned char *d = reinterpret_cast<const unsigned char*>(b.constData() + off);
+    return (quint16)(d[0] | (d[1] << 8));
+}
+static inline quint32 readU32LE(const QByteArray &b, int off) {
+    const unsigned char *d = reinterpret_cast<const unsigned char*>(b.constData() + off);
+    return (quint32)(d[0] | (d[1] << 8) | (d[2] << 16) | (d[3] << 24));
+}
+static inline quint32 readU32BE(const QByteArray &b, int off) {
+    const unsigned char *d = reinterpret_cast<const unsigned char*>(b.constData() + off);
+    return (quint32)((d[0] << 24) | (d[1] << 16) | (d[2] << 8) | d[3]);
+}
+
+// Classic pcap magic numbers
+static const quint32 PCAP_MAGIC_BE = 0xa1b2c3d4u;
+static const quint32 PCAP_MAGIC_LE = 0xd4c3b2a1u;
+// pcap-ng magic (Section Header Block)
+static const quint32 PCAPNG_MAGIC = 0x0A0D0D0Au;
+
+// Internal parser for classic pcap
+static bool extractUdpFromClassicPcap(const QByteArray &all, QVector<QByteArray> &outPayloads, QString &err) {
+    if (all.size() < 24) { err = "File too small to be a pcap"; return false; }
+
+    // Determine endianness
+    quint32 magic = (static_cast<unsigned char>(all[0]) |
+                    (static_cast<unsigned char>(all[1]) << 8) |
+                    (static_cast<unsigned char>(all[2]) << 16) |
+                    (static_cast<unsigned char>(all[3]) << 24));
+    bool le = false;
+    if (magic == PCAP_MAGIC_BE) le = false;
+    else if (magic == PCAP_MAGIC_LE) le = true;
+    else { err = "Not a classic pcap file (bad magic)"; return false; }
+
+    // Read global header fields if needed (we'll skip most)
+    int pos = 24; // global header size
+
+    // Per-record loop
+    while (pos + 16 <= all.size()) {
+        quint32 incl_len = le ? readU32LE(all, pos+8) : readU32BE(all, pos+8);
+        quint32 orig_len = le ? readU32LE(all, pos+12) : readU32BE(all, pos+12);
+        // advance past header
+        pos += 16;
+        if (incl_len == 0 || pos + (int)incl_len > all.size()) break;
+
+        QByteArray pkt = all.mid(pos, static_cast<int>(incl_len));
+        pos += incl_len;
+
+        // parse ethernet
+        if (pkt.size() < 14) continue;
+        quint16 ethType = (static_cast<unsigned char>(pkt[12]) << 8) | static_cast<unsigned char>(pkt[13]);
+        int payloadOffset = 14;
+        // VLAN (0x8100) handling (single tag)
+        if (ethType == 0x8100) {
+            if (pkt.size() < 18) continue;
+            ethType = (static_cast<unsigned char>(pkt[16]) << 8) | static_cast<unsigned char>(pkt[17]);
+            payloadOffset = 18;
+        }
+        if (ethType != 0x0800) continue; // not IPv4
+
+        if (pkt.size() < payloadOffset + 20) continue;
+        const unsigned char *ip = reinterpret_cast<const unsigned char*>(pkt.constData() + payloadOffset);
+        int ihl = (ip[0] & 0x0F) * 4;
+        if (ihl < 20) continue;
+        if (payloadOffset + ihl > pkt.size()) continue;
+        quint8 proto = ip[9];
+        if (proto != 17) continue; // not UDP
+
+        int udpOffset = payloadOffset + ihl;
+        if (udpOffset + 8 > pkt.size()) continue;
+        const unsigned char *udp = reinterpret_cast<const unsigned char*>(pkt.constData() + udpOffset);
+        quint16 udpLen = (udp[4] << 8) | udp[5];
+        int udpPayloadLen = udpLen > 8 ? udpLen - 8 : (pkt.size() - (udpOffset + 8));
+        if (udpOffset + 8 + udpPayloadLen > pkt.size()) {
+            udpPayloadLen = pkt.size() - (udpOffset + 8);
+            if (udpPayloadLen <= 0) continue;
+        }
+        QByteArray payload = QByteArray::fromRawData(reinterpret_cast<const char*>(udp + 8), udpPayloadLen);
+        outPayloads.append(payload);
+    }
+
+    return true;
+}
+
+// Parser for pcap-ng: scan blocks, pick Enhanced Packet Block (type 0x00000006)
+static bool extractUdpFromPcapNg(const QByteArray &all, QVector<QByteArray> &outPayloads, QString &err) {
+    int pos = 0;
+    int len = all.size();
+
+    // Expect Section Header Block at start
+    if (pos + 12 > len) { err = "pcap-ng file too small"; return false; }
+    quint32 blockType = readU32BE(all, pos);
+    if (blockType != 0x0A0D0D0A) { err = "Not pcap-ng"; return false; }
+
+    // iterate blocks
+    while (pos + 8 <= len) {
+        if (pos + 8 > len) break;
+        quint32 bType = readU32BE(all, pos);
+        quint32 bTotalLen = readU32BE(all, pos + 4);
+        if (bTotalLen == 0 || (pos + (int)bTotalLen > len)) break;
+
+        // Enhanced Packet Block (EPB) => type 0x00000006
+        if (bType == 0x00000006) {
+            // EPB structure (all BE as read):
+            // 0-3: block type
+            // 4-7: block total length
+            // 8-11: interface id
+            // 12-15: timestamp high
+            // 16-19: timestamp low
+            // 20-23: captured len
+            // 24-27: original len
+            // 28-... packet data (captured_len), then padding to 32-bit, then options, then block_total_len
+            if (pos + 28 > len) { pos += bTotalLen; continue; }
+            quint32 capLen = readU32BE(all, pos + 20);
+            int dataOffset = pos + 28;
+            if (dataOffset + (int)capLen > pos + (int)bTotalLen) {
+                pos += bTotalLen;
+                continue;
+            }
+            QByteArray pkt = all.mid(dataOffset, static_cast<int>(capLen));
+
+            // parse ethernet/IPv4/UDP inside pkt
+            if (pkt.size() < 14) { pos += bTotalLen; continue; }
+            quint16 ethType = (static_cast<unsigned char>(pkt[12]) << 8) | static_cast<unsigned char>(pkt[13]);
+            int payloadOffset = 14;
+            if (ethType == 0x8100) {
+                if (pkt.size() < 18) { pos += bTotalLen; continue; }
+                ethType = (static_cast<unsigned char>(pkt[16]) << 8) | static_cast<unsigned char>(pkt[17]);
+                payloadOffset = 18;
+            }
+            if (ethType != 0x0800) { pos += bTotalLen; continue; }
+
+            if (pkt.size() < payloadOffset + 20) { pos += bTotalLen; continue; }
+            const unsigned char *ip = reinterpret_cast<const unsigned char*>(pkt.constData() + payloadOffset);
+            int ihl = (ip[0] & 0x0F) * 4;
+            if (ihl < 20) { pos += bTotalLen; continue; }
+            if (payloadOffset + ihl > pkt.size()) { pos += bTotalLen; continue; }
+            quint8 proto = ip[9];
+            if (proto != 17) { pos += bTotalLen; continue; }
+
+            int udpOffset = payloadOffset + ihl;
+            if (udpOffset + 8 > pkt.size()) { pos += bTotalLen; continue; }
+            const unsigned char *udp = reinterpret_cast<const unsigned char*>(pkt.constData() + udpOffset);
+            quint16 udpLen = (udp[4] << 8) | udp[5];
+            int udpPayloadLen = udpLen > 8 ? udpLen - 8 : (pkt.size() - (udpOffset + 8));
+            if (udpOffset + 8 + udpPayloadLen > pkt.size()) {
+                udpPayloadLen = pkt.size() - (udpOffset + 8);
+                if (udpPayloadLen <= 0) { pos += bTotalLen; continue; }
+            }
+            QByteArray payload = QByteArray::fromRawData(reinterpret_cast<const char*>(udp + 8), udpPayloadLen);
+            outPayloads.append(payload);
+        }
+
+        pos += bTotalLen;
+    }
+
+    return true;
+}
+
+PcapReader::PcapReader(QObject *parent) : QObject(parent) {}
+
+bool PcapReader::readPcapUdpPayloads(const QString &filename, QVector<QByteArray> &outPayloads, QString &errMsg)
+{
+    outPayloads.clear();
+    QFile f(filename);
+    if (!f.open(QIODevice::ReadOnly)) { errMsg = "Cannot open file: " + f.errorString(); return false; }
+    QByteArray all = f.readAll();
+    f.close();
+
+    if (all.size() < 4) { errMsg = "File too small"; return false; }
+
+    // Check classic pcap magic or pcapng magic
+    quint32 magicBE = readU32BE(all, 0);
+    // Also check little-endian classic magic
+    quint32 magicLE = (static_cast<unsigned char>(all[0]) |
+                     (static_cast<unsigned char>(all[1]) << 8) |
+                     (static_cast<unsigned char>(all[2]) << 16) |
+                     (static_cast<unsigned char>(all[3]) << 24));
+
+    if (magicBE == PCAPNG_MAGIC) {
+        // pcap-ng
+        if (!extractUdpFromPcapNg(all, outPayloads, errMsg)) {
+            if (errMsg.isEmpty()) errMsg = "Failed to parse pcap-ng";
+            return false;
+        }
+        return true;
+    } else if (magicLE == PCAP_MAGIC_LE || magicLE == PCAP_MAGIC_BE) {
+        // classic pcap (either endian)
+        if (!extractUdpFromClassicPcap(all, outPayloads, errMsg)) {
+            if (errMsg.isEmpty()) errMsg = "Failed to parse classic pcap";
+            return false;
+        }
+        return true;
+    } else {
+        errMsg = "Unknown pcap magic; unsupported file format";
+        return false;
+    }
+}
+
+
+
+
+
+
+#ifndef RECEIVER_H
+#define RECEIVER_H
+
+#include <QObject>
+#include <QVector>
+#include "udplistener.h"
+#include "cat08parser.h"
+
+class Receiver : public QObject
+{
+    Q_OBJECT
+public:
+    explicit Receiver(QObject *parent = nullptr);
+    ~Receiver();
+
+    bool start(int mode, const QString &group, quint16 port); // mode 1=broadcast, 2=multicast
+    void stop();
+
+signals:
+    void weatherReceived(const DecodedWeather &msg);
+
+private slots:
+    void onDatagram(const QByteArray &data, const QHostAddress &sender, quint16 port);
+
+private:
+    UdpListener *m_listener = nullptr;
+    Cat08Parser *m_parser = nullptr;
+};
+
+#endif // RECEIVER_H
+
+
+
+
+
+
+
+#include "receiver.h"
+#include <QDebug>
+
+Receiver::Receiver(QObject *parent)
+    : QObject(parent),
+      m_listener(new UdpListener(9000, this)),
+      m_parser(new Cat08Parser(this))
+{
+    // when UDP receives → parse
+    connect(m_listener, &UdpListener::datagramReceived,
+            this, &Receiver::onDatagram);
+
+    // when parser parses → forward weather frame
+    connect(m_parser, &Cat08Parser::parsed,
+            this, &Receiver::weatherReceived);
+}
+
+Receiver::~Receiver()
+{
+    stop();
+}
+
+bool Receiver::start(int mode, const QString &group, quint16 port)
+{
+    stop();
+
+    m_listener = new UdpListener(port, this);
+    connect(m_listener, &UdpListener::datagramReceived,
+            this, &Receiver::onDatagram);
+
+    if (mode == 1)
+        return m_listener->start();
+    else
+        return m_listener->startMulticast(group);
+}
+
+void Receiver::stop()
+{
+    if (m_listener) {
+        m_listener->stop();
+        m_listener->deleteLater();
+        m_listener = nullptr;
+    }
+}
+
+void Receiver::onDatagram(const QByteArray &data, const QHostAddress &sender, quint16 port)
+{
+    Q_UNUSED(sender)
+    Q_UNUSED(port)
+
+    DecodedWeather out;
+    if (!m_parser->parseDataBlock(data, out)) {
+        qWarning() << "Receiver: CAT08 parse failed, len=" << data.size();
+        return;
+    }
+
+    emit weatherReceived(out);
+}
+
+
+
+
+
+
+
+
+
+#include "mainwindow.h"
+#include <QPushButton>
+#include <QLineEdit>
+#include <QRadioButton>
+#include <QGraphicsView>
+#include <QGraphicsLineItem>
+#include <QTableWidget>
+#include <QVBoxLayout>
+#include <QHBoxLayout>
+#include <QGroupBox>
+#include <QMessageBox>
+#include <QFileDialog>
+#include <QHeaderView>
+#include <QDebug>
+
+MainWindow::MainWindow(QWidget *parent)
+    : QMainWindow(parent),
+      m_scene(new QGraphicsScene(this)),
+      m_receiver(new Receiver(this)),
+      m_pcapReader(new PcapReader(this)),
+      m_refLat(52.5200),
+      m_refLon(13.4050),
+      m_scaleMetersToPixels(0.0006)
+{
+    setupUi();
+
+    connect(m_receiver, &Receiver::weatherReceived,
+            this, &MainWindow::onWeatherReceived);
+}
+
+MainWindow::~MainWindow()
+{
+    m_receiver->stop();
+}
+
+void MainWindow::setupUi()
+{
+    QWidget *central = new QWidget(this);
+    setCentralWidget(central);
+
+    // side controls panel
+    m_broadcastRadio = new QRadioButton("Broadcast");
+    m_multicastRadio = new QRadioButton("Multicast");
+    m_portEdit = new QLineEdit("9000");
+    m_groupEdit = new QLineEdit("239.255.0.1");
+    m_startBtn = new QPushButton("Start");
+    m_openPcapBtn = new QPushButton("Open PCAP");
+    m_status = new QLabel("Stopped");
+
+    m_broadcastRadio->setChecked(true);
+    m_groupEdit->setEnabled(false);
+
+    connect(m_multicastRadio, &QRadioButton::toggled,
+            this, [this](bool t){ m_groupEdit->setEnabled(t); });
+
+    connect(m_startBtn, &QPushButton::clicked,
+            this, &MainWindow::onStartClicked);
+
+    connect(m_openPcapBtn, &QPushButton::clicked,
+            this, &MainWindow::onOpenPcap);
+
+    QGridLayout *g = new QGridLayout;
+    g->addWidget(m_broadcastRadio, 0, 0);
+    g->addWidget(m_multicastRadio, 0, 1);
+    g->addWidget(new QLabel("Port:"), 1, 0);
+    g->addWidget(m_portEdit, 1, 1);
+    g->addWidget(new QLabel("Group:"), 2, 0);
+    g->addWidget(m_groupEdit, 2, 1);
+    g->addWidget(m_startBtn, 3, 0, 1, 2);
+    g->addWidget(m_openPcapBtn, 4, 0, 1, 2);
+
+    QGroupBox *box = new QGroupBox("Receiver & Controls");
+    box->setLayout(g);
+
+    // graphics view
+    m_view = new QGraphicsView(m_scene);
+    m_view->setMinimumSize(700, 500);
+    m_view->setRenderHint(QPainter::Antialiasing);
+    m_view->setBackgroundBrush(Qt::black);
+
+    // table
+    m_table = new QTableWidget(0, 7);
+    m_table->setHorizontalHeaderLabels(
+        {"Idx", "ID", "X1", "Y1", "X2", "Y2", "Intensity"});
+    m_table->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
+
+    // layouts
+    QVBoxLayout *left = new QVBoxLayout;
+    left->addWidget(box);
+    left->addWidget(m_status);
+    left->addStretch();
+
+    QWidget *leftWidget = new QWidget;
+    leftWidget->setLayout(left);
+    leftWidget->setMaximumWidth(300);
+
+    QHBoxLayout *top = new QHBoxLayout;
+    top->addWidget(leftWidget);
+    top->addWidget(m_view, 1);
+
+    QVBoxLayout *main = new QVBoxLayout;
+    main->addLayout(top);
+    main->addWidget(m_table);
+
+    central->setLayout(main);
+
+    setWindowTitle("CAT-08 Weather Viewer (Minimal)");
+    resize(1200, 800);
+}
+
+void MainWindow::onStartClicked()
+{
+    quint16 port = m_portEdit->text().toUShort();
+    bool ok;
+
+    if (m_broadcastRadio->isChecked())
+        ok = m_receiver->start(1, "", port);
+    else
+        ok = m_receiver->start(2, m_groupEdit->text(), port);
+
+    if (!ok) {
+        QMessageBox::warning(this, "Receiver", "Failed to start listening");
+        return;
+    }
+
+    m_status->setText("Listening...");
+    m_startBtn->setEnabled(false);
+}
+
+void MainWindow::onOpenPcap()
+{
+    QString fn = QFileDialog::getOpenFileName(this, "Open PCAP", "", "*.pcap *.pcapng");
+    if (fn.isEmpty()) return;
+
+    QVector<QByteArray> payloads;
+    QString err;
+
+    if (!m_pcapReader->readPcapUdpPayloads(fn, payloads, err)) {
+        QMessageBox::warning(this, "PCAP", err);
+        return;
+    }
+
+    QVector<DecodedWeather> frames;
+    Cat08Parser p;
+
+    for (const QByteArray &bytes : payloads) {
+        DecodedWeather w;
+        if (p.parseDataBlock(bytes, w))
+            frames.append(w);
+    }
+
+    if (frames.isEmpty()) {
+        QMessageBox::warning(this, "PCAP", "No CAT-08 found!");
+        return;
+    }
+
+    onPlotImportedFrames(frames);
+}
+
+void MainWindow::onPlotImportedFrames(const QVector<DecodedWeather> &frames)
+{
+    if (frames.isEmpty()) return;
+    drawWeather(frames.last());
+}
+
+void MainWindow::onWeatherReceived(const DecodedWeather &msg)
+{
+    drawWeather(msg);
+}
+
+QColor MainWindow::colorForIntensity(int intensity)
+{
+    int val = qBound(0, intensity, 255);
+    return QColor(val, 255 - val, 0);
+}
+
+QPointF MainWindow::latlonToScenePoint(double lat, double lon)
+{
+    return latLonToScene(lat, lon, m_refLat, m_refLon, m_scaleMetersToPixels);
+}
+
+void MainWindow::drawWeather(const DecodedWeather &msg)
+{
+    m_scene->clear();
+    m_table->setRowCount(0);
+
+    int i = 0;
+    for (const Cat08Vector &v : msg.vectors)
+    {
+        double xm1 = v.x1_nm * 1852;
+        double ym1 = v.y1_nm * 1852;
+        double xm2 = v.x2_nm * 1852;
+        double ym2 = v.y2_nm * 1852;
+
+        QPointF ll1 = cartesianToLatLon(xm1, ym1, m_refLat, m_refLon);
+        QPointF ll2 = cartesianToLatLon(xm2, ym2, m_refLat, m_refLon);
+
+        QPointF p1 = latlonToScenePoint(ll1.x(), ll1.y());
+        QPointF p2 = latlonToScenePoint(ll2.x(), ll2.y());
+
+        QColor c = colorForIntensity(v.intensity);
+        m_scene->addLine(QLineF(p1, p2), QPen(c, 2));
+
+        // animated dots
+        AnimatedDot *dot = new AnimatedDot();
+        dot->setPos(p2);
+        m_scene->addItem(dot);
+
+        int row = m_table->rowCount();
+        m_table->insertRow(row);
+        m_table->setItem(row, 0, new QTableWidgetItem(QString::number(row+1)));
+        m_table->setItem(row, 1, new QTableWidgetItem(QString::number(v.id)));
+        m_table->setItem(row, 2, new QTableWidgetItem(QString::number(v.x1_nm)));
+        m_table->setItem(row, 3, new QTableWidgetItem(QString::number(v.y1_nm)));
+        m_table->setItem(row, 4, new QTableWidgetItem(QString::number(v.x2_nm)));
+        m_table->setItem(row, 5, new QTableWidgetItem(QString::number(v.y2_nm)));
+        m_table->setItem(row, 6, new QTableWidgetItem(QString::number(v.intensity)));
+
+        i++;
+    }
+
+    if (!m_scene->itemsBoundingRect().isEmpty())
+        m_view->fitInView(m_scene->itemsBoundingRect(), Qt::KeepAspectRatio);
+}
+
+
+
+
+
+
+
+#ifndef MAINWINDOW_H
+#define MAINWINDOW_H
+
+#include <QMainWindow>
+#include <QGraphicsScene>
+#include <QMap>
+#include "animateddot.h"
+#include "receiver.h"
+#include "pcapreader.h"
+#include "utils_conv.h"
+
+QT_BEGIN_NAMESPACE
+class QPushButton;
+class QLineEdit;
+class QRadioButton;
+class QGraphicsView;
+class QTableWidget;
+class QLabel;
+QT_END_NAMESPACE
+
+class MainWindow : public QMainWindow
+{
+    Q_OBJECT
+public:
+    MainWindow(QWidget *parent = nullptr);
+    ~MainWindow();
+
+private slots:
+    void onStartClicked();
+    void onWeatherReceived(const DecodedWeather &msg);
+    void onOpenPcap();
+    void onPlotImportedFrames(const QVector<DecodedWeather> &frames);
+
+private:
+    void setupUi();
+    void drawWeather(const DecodedWeather &msg);
+    QColor colorForIntensity(int intensity);
+    QPointF latlonToScenePoint(double lat, double lon);
+
+    // widgets
+    QLineEdit *m_portEdit;
+    QLineEdit *m_groupEdit;
+    QRadioButton *m_broadcastRadio;
+    QRadioButton *m_multicastRadio;
+    QPushButton *m_startBtn;
+    QPushButton *m_openPcapBtn;
+    QGraphicsView *m_view;
+    QGraphicsScene *m_scene;
+    QTableWidget *m_table;
+    QLabel *m_status;
+
+    // backend
+    Receiver *m_receiver;
+    PcapReader *m_pcapReader;
+
+    // animated dots
+    QMap<int, AnimatedDot*> m_dots;
+
+    // map projection reference
+    double m_refLat;
+    double m_refLon;
+    double m_scaleMetersToPixels; 
+
+    QGraphicsPixmapItem *m_mapImage = nullptr;
+};
+
+#endif // MAINWINDOW_H
+
+
+
+
+
+
+
+
+
+#ifndef UTILS_CONV_H
+#define UTILS_CONV_H
+
+#include <QtMath>
+#include <QPointF>
+
+static inline QPointF cartesianToLatLon(double x_m, double y_m,
+                                        double refLat, double refLon)
+{
+    const double R = 6378137.0;
+
+    double dLat = (y_m / R) * (180.0 / M_PI);
+    double dLon = (x_m / (R * qCos(refLat * M_PI / 180.0))) * (180.0 / M_PI);
+
+    return QPointF(refLat + dLat, refLon + dLon);
+}
+
+static inline QPointF latLonToScene(double lat, double lon,
+                                    double refLat, double refLon,
+                                    double scaleMetersToPixels)
+{
+    const double R = 6378137.0;
+
+    double dLat = (lat - refLat) * (M_PI / 180.0);
+    double dLon = (lon - refLon) * (M_PI / 180.0);
+
+    double y = dLat * R;
+    double x = dLon * R * qCos(refLat * M_PI / 180.0);
+
+    return QPointF(x * scaleMetersToPixels, -y * scaleMetersToPixels);
+}
+
+static inline QPointF latLonToScene(double lat, double lon)
+{
+    return QPointF(lon, lat);
+}
+
+static inline QPointF latLonToScenePoint(double lat, double lon,
+                                         double refLat, double refLon,
+                                         double scaleMetersToPixels)
+{
+    return latLonToScene(lat, lon, refLat, refLon, scaleMetersToPixels);
+}
+
+#endif // UTILS_CONV_H
+
+
+
+
+
+
+
+#ifndef ANIMATEDDOT_H
+#define ANIMATEDDOT_H
+
+#include <QGraphicsEllipseItem>
+#include <QPropertyAnimation>
+
+class AnimatedDot : public QGraphicsEllipseItem
+{
+public:
+    AnimatedDot()
+        : QGraphicsEllipseItem(-4, -4, 8, 8)
+    {
+        setBrush(Qt::yellow);
+        setPen(Qt::NoPen);
+
+        m_anim = new QPropertyAnimation(this, "opacity");
+        m_anim->setDuration(900);
+        m_anim->setStartValue(1.0);
+        m_anim->setEndValue(0.1);
+        m_anim->setLoopCount(-1);
+        m_anim->start();
+    }
+
+private:
+    QPropertyAnimation *m_anim;
+};
+
+#endif // ANIMATEDDOT_H
+
+
+
+
+
+
+
+
+
+
+#ifndef PCAPREADER_H
+#define PCAPREADER_H
+
+#include <QObject>
+#include <QVector>
+#include <QByteArray>
+
+class PcapReader : public QObject
+{
+    Q_OBJECT
+public:
+    explicit PcapReader(QObject *parent = nullptr);
+
+    bool readPcapUdpPayloads(const QString &fileName,
+                             QVector<QByteArray> &outPayloads,
+                             QString &error);
+
+private:
+    bool readClassicPcap(QIODevice &dev, QVector<QByteArray> &outPayloads, QString &error);
+    bool readPcapNg(QIODevice &dev, QVector<QByteArray> &outPayloads, QString &error);
+
+    QByteArray extractUdpPayload(const QByteArray &frame);
+};
+
+#endif // PCAPREADER_H
+
+
+
+
+
+
+
+
+
+#include "pcapreader.h"
+#include <QFile>
+#include <QtEndian>
+#include <QDebug>
+
+PcapReader::PcapReader(QObject *parent)
+    : QObject(parent)
+{
+}
+
+bool PcapReader::readPcapUdpPayloads(const QString &fileName,
+                                     QVector<QByteArray> &outPayloads,
+                                     QString &error)
+{
+    QFile f(fileName);
+    if (!f.open(QFile::ReadOnly)) {
+        error = "Cannot open: " + fileName;
+        return false;
+    }
+
+    QByteArray header = f.peek(4);
+
+    if (header.startsWith("\xd4\xc3\xb2\xa1") ||
+        header.startsWith("\xa1\xb2\xc3\xd4") ||
+        header.startsWith("\x4d\x3c\xb2\xa1"))
+    {
+        return readClassicPcap(f, outPayloads, error);
+    }
+    else if (header == QByteArray("\x0a\x0d\x0d\x0a",4))
+    {
+        return readPcapNg(f, outPayloads, error);
+    }
+
+    error = "Unsupported file type";
+    return false;
+}
+
+
+bool PcapReader::readClassicPcap(QIODevice &dev,
+                                 QVector<QByteArray> &outPayloads,
+                                 QString &error)
+{
+    dev.read(24); // skip global header
+
+    while (!dev.atEnd()) {
+        if (dev.bytesAvailable() < 16) break;
+
+        QByteArray pktHdr = dev.read(16);
+        quint32 inclLen = qFromLittleEndian<quint32>((uchar*)pktHdr.constData() + 8);
+
+        if (inclLen == 0 || inclLen > 65535) {
+            error = "Invalid packet length in pcap";
+            return false;
+        }
+
+        QByteArray frame = dev.read(inclLen);
+        if (frame.size() != (int)inclLen) break;
+
+        QByteArray udpData = extractUdpPayload(frame);
+        if (!udpData.isEmpty())
+            outPayloads.append(udpData);
+    }
+
+    return !outPayloads.isEmpty();
+}
+
+
+bool PcapReader::readPcapNg(QIODevice &dev,
+                            QVector<QByteArray> &outPayloads,
+                            QString &error)
+{
+    while (!dev.atEnd()) {
+        if (dev.bytesAvailable() < 8) break;
+
+        QByteArray blockHdr = dev.read(8);
+        quint32 blockType = qFromLittleEndian<quint32>((uchar*)blockHdr.data());
+        quint32 blockLen  = qFromLittleEndian<quint32>((uchar*)blockHdr.data() + 4);
+
+        if (blockLen < 12 || blockLen > 90000000) {
+            error = "Corrupted pcap-ng block";
+            return false;
+        }
+
+        QByteArray data = dev.read(blockLen - 8);
+        dev.read(4); // end length
+
+        if (blockType == 0x00000006) {
+            QByteArray frame = data.mid(28);
+            QByteArray udpData = extractUdpPayload(frame);
+            if (!udpData.isEmpty())
+                outPayloads.append(udpData);
+        }
+    }
+
+    return !outPayloads.isEmpty();
+}
+
+
+QByteArray PcapReader::extractUdpPayload(const QByteArray &frame)
+{
+    if (frame.size() < 42) return {};
+
+    int ethType = (uchar)frame[12] << 8 | (uchar)frame[13];
+    if (ethType != 0x0800) return {}; // IPv4 only
+
+    int ipHeaderLen = (frame[14] & 0x0F) * 4;
+    int proto = frame[23];
+
+    if (proto != 17) return {}; // UDP
+
+    int udpStart = 14 + ipHeaderLen;
+    int udpLen = (uchar)frame[udpStart + 4] << 8 | (uchar)frame[udpStart + 5];
+
+    int payloadStart = udpStart + 8;
+    int payloadSize = udpLen - 8;
+
+    if (payloadStart + payloadSize > frame.size()) return {};
+
+    return frame.mid(payloadStart, payloadSize);
+}
+
+
+
+
+
+
+
+
+
+
+#include "cat08parser.h"
+#include <QtEndian>
+#include <QDebug>
+#include <QDateTime>
+#include <cmath>
+
+// Constructor
+Cat08Parser::Cat08Parser(QObject *parent) : QObject(parent) { }
+
+/* ----------------------
+ * Basic readers (big-endian as ASTERIX uses network order)
+ * ----------------------*/
+quint8 Cat08Parser::readU8(const QByteArray &b, int pos) const {
+    if (pos < 0 || pos >= b.size()) return 0;
+    return static_cast<quint8>(b.at(pos));
+}
+quint16 Cat08Parser::readU16(const QByteArray &b, int pos) const {
+    if (pos + 1 >= b.size()) return 0;
+    quint16 v;
+    memcpy(&v, b.constData() + pos, 2);
+    return qFromBigEndian<quint16>(v);
+}
+qint16 Cat08Parser::readS16(const QByteArray &b, int pos) const {
+    if (pos + 1 >= b.size()) return 0;
+    qint16 v;
+    memcpy(&v, b.constData() + pos, 2);
+    return qFromBigEndian<qint16>(v);
+}
+quint32 Cat08Parser::readU32(const QByteArray &b, int pos) const {
+    if (pos + 3 >= b.size()) return 0;
+    quint32 v;
+    memcpy(&v, b.constData() + pos, 4);
+    return qFromBigEndian<quint32>(v);
+}
+
+/* ----------------------
+ * FSPEC multi-octet reader
+ * Produces bool list for FRN presence (index 0 -> FRN1)
+ * ----------------------*/
+bool Cat08Parser::readFspecList(const QByteArray &b, int &pos, QVector<bool> &present)
+{
+    present.clear();
+    int p = pos;
+    while (p < b.size()) {
+        quint8 oct = readU8(b, p++);
+        // bits 8..2 (we'll push bit7..1 order)
+        for (int bit = 7; bit >= 1; --bit) {
+            present.append((oct & (1 << bit)) != 0);
+        }
+        bool ext = (oct & 0x01);
+        if (!ext) break;
+    }
+    pos = p;
+    return true;
+}
+
+/* ----------------------
+ * Utility conversion helper:
+ * ASTERIX often gives coordinates as signed integers that need scaling.
+ * Two schemes appear: raw (assumed as NM * (2^-5) in some FRNs) or direct NM.
+ * We'll use twoPowNeg5ToNM for those FRNs that use 2^-5 scaling.
+ * ----------------------*/
+double Cat08Parser::twoPowNeg5ToNM(int16_t raw) const {
+    return double(raw) * std::pow(2.0, -5); // = raw * 1/32
+}
+
+/* ----------------------
+ * Individual FRN parsers
+ * All parsers must check bounds carefully and push raw bytes into out.rawFRN
+ * ----------------------*/
+
+int Cat08Parser::parseDI_010(const QByteArray &b, int pos, DecodedWeather &out)
+{
+    // SAC(1) SIC(1)
+    if (pos + 1 >= b.size()) return pos;
+    int start = pos;
+    out.sac = readU8(b, pos); pos++;
+    out.sic = readU8(b, pos); pos++;
+    out.rawFRN.insert(10, b.mid(start, pos - start)); // key 10 -> FRN1 (human readable)
+    return pos;
+}
+
+int Cat08Parser::parseDI_000(const QByteArray &b, int pos, DecodedWeather &out)
+{
+    // Message type (1)
+    if (pos >= b.size()) return pos;
+    int start = pos;
+    out.messageType = readU8(b, pos); pos++;
+    out.rawFRN.insert(0, b.mid(start, pos - start)); // key 0 -> FRN2 per earlier mapping
+    return pos;
+}
+
+int Cat08Parser::parseDI_020(const QByteArray &b, int pos, DecodedWeather &out)
+{
+    // Time of day — often 4 bytes (seconds or sec/128). We'll store as raw and set timestamp.
+    if (pos + 3 >= b.size()) return pos;
+    int start = pos;
+    quint32 tod = readU32(b, pos); pos += 4;
+    // Some vendors send sec*128 format; cannot be certain — store raw & fill timestamp as seconds
+    out.timestamp = static_cast<qint64>(tod);
+    out.rawFRN.insert(20, b.mid(start, pos - start));
+    return pos;
+}
+
+int Cat08Parser::parseDI_036(const QByteArray &b, int pos, DecodedWeather &out)
+{
+    // Cartesian cell: usually count? But spec varies. We'll handle single cell entry of x,y,intensity[,id]
+    if (pos + 4 >= b.size()) return pos;
+    int start = pos;
+    // Many implementations start with a count; if first byte is small and next bytes align, treat accordingly.
+    // However in some CAT08 versions FRN036 is repeated entries without explicit count — we will attempt safe parse:
+    // We'll attempt to read a single x(2), y(2), intensity(1), optional id(2) repeatedly while space allows.
+    while (pos + 4 < b.size()) {
+        // ensure not hitting next FRN boundary: we can't know length here, so parse at least one
+        qint16 rx = readS16(b, pos); pos += 2;
+        qint16 ry = readS16(b, pos); pos += 2;
+        int intensity = 0;
+        if (pos < b.size()) { intensity = readU8(b, pos); pos++; }
+        int id = -1;
+        // optional id if enough bytes and next byte doesn't look like an FSPEC
+        if (pos + 1 < b.size()) {
+            id = readU16(b, pos); pos += 2;
+        }
+        Cat08Vector v;
+        // Many FRN036 encodes coordinates directly in NM scaled by 2^-5 or direct; we assume twoPowNeg5ToNM like others:
+        v.x1_nm = twoPowNeg5ToNM(rx);
+        v.y1_nm = twoPowNeg5ToNM(ry);
+        v.x2_nm = v.x1_nm;
+        v.y2_nm = v.y1_nm;
+        v.intensity = intensity;
+        v.id = id;
+        v.timestamp = out.timestamp;
+        out.vectors.append(v);
+
+        // Heuristic: break if we've consumed a lot (avoid infinite loops)
+        if (pos - start > 1024) break;
+    }
+    out.rawFRN.insert(36, b.mid(start, pos - start));
+    return pos;
+}
+
+int Cat08Parser::parseDI_034(const QByteArray &b, int pos, DecodedWeather &out)
+{
+    // Polar vectors: typically repeated blocks of range(2), azimuth(2), intensity(1), optional id(2)
+    if (pos + 4 >= b.size()) return pos;
+    int start = pos;
+
+    // Many FRN034 include a count first; if the remaining length mod itemsize suggests count, handle both cases.
+    // We'll attempt to read: if first byte is small likely it's a count (<=50), otherwise treat as first range hi byte.
+    int remaining = b.size() - pos;
+    // If single count byte available and remaining > (count * 7), treat as count format
+    quint8 possibleCount = readU8(b, pos);
+    if (possibleCount > 0 && remaining >= (1 + possibleCount * 7) && possibleCount < 200) {
+        // count format
+        quint8 n = possibleCount; pos++;
+        for (int i=0;i<n;i++) {
+            if (pos + 6 > b.size()) break;
+            quint16 range_raw = readU16(b, pos); pos += 2;
+            quint16 az_raw = readU16(b, pos); pos += 2;
+            int intensity = readU8(b, pos); pos++;
+            int id = -1;
+            if (pos + 1 < b.size()) { id = readU16(b, pos); pos += 2; }
+            double range_nm = double(range_raw) / 128.0; // typical scaling
+            double az_deg = (az_raw * 360.0) / 65536.0;
+            double az_rad = az_deg * M_PI / 180.0;
+            double x_nm = range_nm * sin(az_rad);
+            double y_nm = range_nm * cos(az_rad);
+            Cat08Vector v;
+            v.x1_nm = x_nm; v.y1_nm = y_nm;
+            v.x2_nm = x_nm; v.y2_nm = y_nm;
+            v.intensity = intensity;
+            v.id = id;
+            v.timestamp = out.timestamp;
+            out.vectors.append(v);
+        }
+    } else {
+        // item-by-item parse until next FRN — read as many full items as available (each 7-8 bytes)
+        while (pos + 6 <= b.size()) {
+            quint16 range_raw = readU16(b, pos); pos += 2;
+            quint16 az_raw = readU16(b, pos); pos += 2;
+            int intensity = 0;
+            if (pos < b.size()) { intensity = readU8(b, pos); pos++; }
+            int id = -1;
+            if (pos + 1 < b.size()) { id = readU16(b, pos); pos += 2; }
+            double range_nm = double(range_raw) / 128.0;
+            double az_deg = (az_raw * 360.0) / 65536.0;
+            double az_rad = az_deg * M_PI / 180.0;
+            double x_nm = range_nm * sin(az_rad);
+            double y_nm = range_nm * cos(az_rad);
+            Cat08Vector v;
+            v.x1_nm = x_nm; v.y1_nm = y_nm;
+            v.x2_nm = x_nm; v.y2_nm = y_nm;
+            v.intensity = intensity;
+            v.id = id;
+            v.timestamp = out.timestamp;
+            out.vectors.append(v);
+        }
+    }
+
+    out.rawFRN.insert(34, b.mid(start, pos - start));
+    return pos;
+}
+
+int Cat08Parser::parseDI_040(const QByteArray &b, int pos, DecodedWeather &out)
+{
+    // Weather quality: variable length. Many vendors send 1 octet length then block.
+    if (pos >= b.size()) return pos;
+    int start = pos;
+    quint8 len = readU8(b, pos);
+    // If len seems implausible (like > remaining), treat it as single octet block
+    if (pos + len >= b.size()) {
+        // read as single octet
+        out.rawFRN.insert(40, b.mid(pos, 1));
+        return pos + 1;
+    }
+    out.rawFRN.insert(40, b.mid(pos, len + 1));
+    return pos + len + 1;
+}
+
+int Cat08Parser::parseDI_050(const QByteArray &b, int pos, DecodedWeather &out)
+{
+    // Contours: usually count + repeated x(2), y(2)
+    if (pos >= b.size()) return pos;
+    int start = pos;
+    quint8 count = readU8(b, pos); pos++;
+    for (int i=0;i<count;i++) {
+        if (pos + 3 >= b.size()) break;
+        qint16 rx = readS16(b, pos); pos += 2;
+        qint16 ry = readS16(b, pos); pos += 2;
+        Cat08Vector v;
+        v.x1_nm = twoPowNeg5ToNM(rx);
+        v.y1_nm = twoPowNeg5ToNM(ry);
+        v.x2_nm = v.x1_nm;
+        v.y2_nm = v.y1_nm;
+        v.intensity = 10; // contour low intensity
+        v.id = -1;
+        v.timestamp = out.timestamp;
+        out.vectors.append(v);
+    }
+    out.rawFRN.insert(50, b.mid(start, pos - start));
+    return pos;
+}
+
+int Cat08Parser::parseDI_060_070_080_090(const QByteArray &b, int pos, DecodedWeather &out, int di)
+{
+    // Generic handler for various smaller FRNs — read length-prefixed block where possible
+    if (pos >= b.size()) return pos;
+    int start = pos;
+    quint8 len = readU8(b, pos);
+    // if len too big, clamp
+    int toRead = (pos + len <= b.size()) ? len : (b.size() - pos);
+    out.rawFRN.insert(di, b.mid(pos, toRead + 1));
+    return pos + toRead + 1;
+}
+
+int Cat08Parser::parseDI_038(const QByteArray &b, int pos, DecodedWeather &out)
+{
+    // Vector pairs: typically count + items of [ID(1) | x1(2) y1(2) x2(2) y2(2) intensity(1) [optional id(2)]]
+    if (pos >= b.size()) return pos;
+    int start = pos;
+    quint8 count = readU8(b, pos); pos++;
+    for (int i=0;i<count;i++) {
+        if (pos + 9 > b.size()) break; // need at least id + 4*2 + intensity
+        Cat08Vector v;
+        // ID sometimes 1 byte, sometimes 2 — we'll read 1 byte first as per common test packets
+        v.id = readU8(b, pos); pos++;
+        qint16 rx1 = readS16(b, pos); pos += 2;
+        qint16 ry1 = readS16(b, pos); pos += 2;
+        qint16 rx2 = readS16(b, pos); pos += 2;
+        qint16 ry2 = readS16(b, pos); pos += 2;
+        v.x1_nm = twoPowNeg5ToNM(rx1);
+        v.y1_nm = twoPowNeg5ToNM(ry1);
+        v.x2_nm = twoPowNeg5ToNM(rx2);
+        v.y2_nm = twoPowNeg5ToNM(ry2);
+        v.intensity = 0;
+        if (pos < b.size()) { v.intensity = readU8(b, pos); pos++; }
+        // optional 2-byte id (if present and non-zero, override)
+        if (pos + 1 < b.size()) {
+            quint16 optid = readU16(b, pos);
+            // Heuristic: if optid is a plausible id (non-zero and < 65535) and we haven't consumed next FRN,
+            // then accept it. We'll accept and advance.
+            v.id = static_cast<int>(optid);
+            pos += 2;
+        }
+        v.timestamp = out.timestamp;
+        out.vectors.append(v);
+    }
+    out.rawFRN.insert(38, b.mid(start, pos - start));
+    return pos;
+}
+
+/* ----------------------
+ * Top-level parse function
+ * ----------------------*/
+bool Cat08Parser::parseDataBlock(const QByteArray &data, DecodedWeather &out)
+{
+    out = DecodedWeather();
+
+    if (data.size() < 3) return false;
+    int pos = 0;
+    quint8 cat = readU8(data, pos); pos++;
+    if (cat != 0x08) {
+        qWarning() << "Cat08Parser: Not CAT=8 (got)" << cat;
+        return false;
+    }
+
+    // length field (2 bytes)
+    quint16 len = readU16(data, pos); pos += 2;
+    Q_UNUSED(len); // not strictly needed for validation here
+
+    // FSPEC list
+    QVector<bool> present;
+    if (!readFspecList(data, pos, present)) {
+        qWarning() << "Cat08Parser: FSPEC parse failed";
+        return false;
+    }
+
+    // Ensure present vector long enough for 12 FRNs
+    while (present.size() < 12) present.append(false);
+
+    // Parse FRNs in order
+    if (present[0]) pos = parseDI_010(data, pos, out);       // FRN1
+    if (present[1]) pos = parseDI_000(data, pos, out);       // FRN2
+    if (present[2]) pos = parseDI_020(data, pos, out);       // FRN3
+    if (present[3]) pos = parseDI_036(data, pos, out);       // FRN4 Cartesian
+    if (present[4]) pos = parseDI_034(data, pos, out);       // FRN5 Polar
+    if (present[5]) pos = parseDI_040(data, pos, out);       // FRN6 Quality
+    if (present[6]) pos = parseDI_050(data, pos, out);       // FRN7 Contours
+    if (present[7]) pos = parseDI_060_070_080_090(data, pos, out, 60);
+    if (present[8]) pos = parseDI_060_070_080_090(data, pos, out, 70);
+    if (present[9]) pos = parseDI_060_070_080_090(data, pos, out, 80);
+    if (present[10]) pos = parseDI_060_070_080_090(data, pos, out, 90);
+    if (present[11]) pos = parseDI_038(data, pos, out);      // FRN12 vector pairs
+
+    // set timestamp if not already set
+    if (out.timestamp == 0) {
+        out.timestamp = static_cast<qint64>(QDateTime::currentSecsSinceEpoch());
+    }
+
+    emit parsed(out);
+    return true;
+}
