@@ -1,0 +1,44 @@
+void MainWindow::onWeatherReceived(const DecodedWeather &msg)
+{
+    for (const Cat08Vector &v : msg.vectors)
+    {
+        int id = v.id;
+        if (id < 0) continue;
+
+        // -------------- 1) Ensure animated dot for this ID exists --------------
+        if (!m_dots.contains(id)) {
+            AnimatedDot *dot = new AnimatedDot(8.0);
+            m_scene->addItem(dot);
+            dot->setPos(v.x1_nm, v.y1_nm);
+            m_dots[id] = dot;
+        }
+
+        AnimatedDot *dot = m_dots[id];
+
+        // -------------- 2) Remove previous trail for this ID --------------
+        if (m_trails.contains(id)) {
+            for (QGraphicsItem *it : m_trails[id])
+                m_scene->removeItem(it);
+            m_trails[id].clear();
+        }
+
+        QVector<QGraphicsItem*> newTrail;
+
+        // -------------- 3) Draw this vector as line --------------
+        QGraphicsLineItem *line =
+            m_scene->addLine(
+                v.x1_nm, v.y1_nm,
+                v.x2_nm, v.y2_nm,
+                QPen(Qt::cyan, 2));
+
+        newTrail.push_back(line);
+
+        // -------------- 4) Move dot to the end of vector --------------
+        dot->moveTo(QPointF(v.x2_nm, v.y2_nm));
+
+        // -------------- 5) Save new trail --------------
+        m_trails[id] = newTrail;
+    }
+
+    m_status->setText("CAT-08 Weather received");
+}
